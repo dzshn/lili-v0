@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "lili-py"
+version = "0.1.0"
+description = "Python bytecode dissection and debugging."
+authors = ["Sofia N. Lima <me@dzshn.xyz>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+ike = {git = "https://github.com/dzshn/ike", branch = "main"}
+
+[tool.poetry.dev-dependencies]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
