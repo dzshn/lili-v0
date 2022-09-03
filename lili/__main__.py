@@ -2,6 +2,7 @@ import ast
 import curses
 import curses.ascii
 import getopt
+# import inspect
 import marshal
 import opcode
 import re
@@ -10,7 +11,7 @@ import tokenize
 import types
 import warnings
 from collections import namedtuple
-from typing import BinaryIO, TextIO, Union, Optional
+from typing import BinaryIO, Optional, Union
 
 from ike.bytecode import PartialCode, UnsafeBytecode
 
@@ -35,23 +36,24 @@ Args:
 
 Flags:
     -h, --help       Print dis message
-    -c, --compile    Compile the input file, then edit it\
+    -c, --compile    Compile the input file, then edit it
+    -f, --force      Open the file regardless of compatibility\
 """
 
 warnings.simplefilter("always", UnsafeBytecode)
 
 
-def read_pyc(f: BinaryIO) -> types.CodeType:
+def read_pyc(f: BinaryIO, force: bool = False) -> tuple[bytes, types.CodeType]:
     f.seek(0)
     header = f.read(16)
     if len(header) < 16:
         raise EOFError
-    if header[:4] != MAGIC_NUMBER:
+    if header[:4] != MAGIC_NUMBER and not force:
         raise RuntimeError(
             "Can't open %s: wrong python version?" % f.name
         )
     flags = int.from_bytes(header[4:8], "little")
-    if flags & ~0b11:
+    if flags & ~0b11 and not force:
         raise RuntimeError(
             "Can't open %s: unknown flags (%s)" % f.name, flags
         )
@@ -59,7 +61,7 @@ def read_pyc(f: BinaryIO) -> types.CodeType:
     if type(co) is not types.CodeType:  # noqa
         raise RuntimeError("Can't open %s: whar")
 
-    return co
+    return header, co
 
 
 def get_scope(code: PartialCode, op: int) -> Optional[list[object]]:
@@ -94,7 +96,10 @@ def unparse(co: types.CodeType) -> list[str]:
     if co.co_consts:
         src.append("CONSTS:")
         for x in co.co_consts:
-            src.append("    " + repr(x))
+            if type(x) is types.CodeType:  # noqa
+                src.append("    %" + repr(marshal.dumps(x)))
+            else:
+                src.append("    " + repr(x))
     for section, field in [
         ("NAMES", co.co_names),
         ("VARNAMES", co.co_varnames),
@@ -109,7 +114,7 @@ def unparse(co: types.CodeType) -> list[str]:
     src.append(f"STACKSIZE: {co.co_stacksize}")
     src.append("")
     for op, arg in zip(*[iter(co.co_code)] * 2):
-        if op >= opcode.HAVE_ARGUMENT:
+        if op >= opcode.HAVE_ARGUMENT or arg:
             src.append(opcode.opname[op] + " %" + str(arg))
         else:
             src.append(opcode.opname[op])
@@ -117,11 +122,52 @@ def unparse(co: types.CodeType) -> list[str]:
     return src
 
 
+def evaluate(n: Union[str, ast.AST]) -> object:
+    """Like ast.literal_eval, but supporting all marshallable objects."""
+    if isinstance(n, str):
+        if n.startswith("%"):
+            return "JO BIDEN !!"
+        n = compile(n.lstrip(" \t"), "<lili>", "eval", ast.PyCF_ONLY_AST).body
+
+    if isinstance(n, ast.Constant):
+        return n.value
+    if isinstance(n, ast.Name):
+        if n.id == "Ellipsis":
+            return Ellipsis
+        if n.id == "StopIteration":
+            return StopIteration
+    if seq := {ast.Tuple: tuple, ast.List: list, ast.Set: set}.get(type(n)):
+        return seq(map(evaluate, n.elts))
+    if isinstance(n, ast.Dict):
+        return dict(zip(map(evaluate, n.keys), map(evaluate, n.values)))
+    if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub)):
+        if isinstance(n.op, ast.USub):
+            return -evaluate(n.operand)
+        return +evaluate(n.operand)
+    if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub)):
+        l, r = evaluate(n.left), evaluate(n.right)
+        if isinstance(l, (int, float)) and isinstance(r, complex):
+            if isinstance(n.op, ast.Add):
+                return l + r
+            return l - r
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+        if n.func.id == "set" and n.args == n.keywords == []:
+            return set()
+        if n.func.id == "frozenset" and n.keywords == []:
+            if n.args == []:
+                return frozenset()
+            if len(n.args) == 1:
+                return frozenset(evaluate(n.args[0]))
+
+    raise ValueError
+
+
 class Editor:
     def __init__(
         self,
-        file: Union[BinaryIO, TextIO, str, None] = None,
+        file: Optional[str] = None,
         needs_compile: bool = False,
+        force: bool = False,
     ):
         if file is None:
             self.filename = None
@@ -132,14 +178,19 @@ class Editor:
                 "RETURN_VALUE",
             ]
             self.code = PartialCode([], [], [])
-        elif isinstance(file, str):
+            self.format = "none"
+        else:
             self.filename = file
             try:
                 f = open(file, "rb")
             except FileNotFoundError:
                 self.src = [""]
                 self.code = PartialCode([], [], [])
-
+                fmt = file.rsplit(".", 1)[1]
+                if fmt in {"py", "pyc", "pyll"}:
+                    self.format = fmt
+                else:
+                    self.format = "none"
             else:
                 try:
                     self.code = PartialCode([], [], [])
@@ -147,21 +198,26 @@ class Editor:
                     if needs_compile:
                         self.src = unparse(compile(content, file, "exec"))
                         self.filename += "ll"
+                        self.format = "pyll(generated)"
                     else:
                         self.src = content.split("\n")
+                        self.format = "pyll"
 
                 except UnicodeDecodeError:
                     try:
-                        co = read_pyc(f)
+                        header, co = read_pyc(f, force=force)
                     except Exception as e:
                         raise e from None
                     self.code = PartialCode([], [], [])
                     self.src = unparse(co)
-        else:
-            raise NotImplementedError
+                    self.format = "pyc(MAGIC=%i%s:F=%x)" % (
+                        int.from_bytes(header[:2], "little"),
+                        "[HEXED!]" if header[:4] != MAGIC_NUMBER else "",
+                        int.from_bytes(header[4:8], "little"),
+                    )
 
-        self.cy = len(self.src) - 1
-        self.cx = len(self.src[self.cy])
+        self.cy = 0
+        self.cx = 0
         self.update_code()
 
     def parse(self):
@@ -257,8 +313,8 @@ class Editor:
                     if op[0] == "@":
                         if instr in opcode.hasconst:
                             try:
-                                const = ast.literal_eval(val)
-                            except (SyntaxError, ValueError):
+                                const = evaluate(val)
+                            except Exception:
                                 pass
                             else:
                                 arg = idx(self.code.constants, const)
@@ -272,13 +328,13 @@ class Editor:
                             arg = scope.index(name)
                         else:
                             try:
-                                arg = ast.literal_eval(val)
-                            except (ValueError, SyntaxError):
+                                arg = evaluate(val)
+                            except Exception:
                                 pass
                     else:
                         try:
-                            arg = ast.literal_eval(val)
-                        except (ValueError, SyntaxError):
+                            arg = evaluate(val)
+                        except Exception:
                             pass
                 else:
                     arg = 0
@@ -289,14 +345,14 @@ class Editor:
                     self.offsets[li + i] = bc
                     bc += 1
 
-        if "CONSTANTS" in sections:
-            for ln in sections["CONSTANTS"]:
+        if "CONSTS" in sections:
+            for ln in sections["CONSTS"]:
                 if ln.startswith("%"):
                     self.code.constants.append("JO BIDEN !!")
                 else:
                     try:
-                        const = ast.literal_eval(ln)
-                    except (SyntaxError, ValueError):
+                        const = evaluate(ln)
+                    except Exception:
                         pass
                     else:
                         if idx(self.code.constants, const) == -1:
@@ -311,6 +367,25 @@ class Editor:
             for ln in sections["FREEVARS"]:
                 self.code.freevars.append(ln.strip())
 
+    def redraw(self):
+        editor = self.editor
+        editor.erase()
+
+        for i, tokens in enumerate(self.parsed):
+            offset = self.offsets.get(i)
+            editor.move(i, 0)
+            editor.clrtoeol()
+            for t, v in tokens:
+                color = {
+                    "name": 2, "op": 3, "const": 4, "section": 2, "field": 4
+                }.get(t, 5)
+                editor.addstr(v, curses.color_pair(color))
+
+            if offset is not None:
+                instr, arg = raw = self.code.bytecode[offset*2:offset*2+2]
+                editor.addstr("\t" + raw.hex(" "), curses.color_pair(8))
+                # if instr in opcode.hasjabs:
+                #     editor.addstr(self.lines[arg], 32, "<<")
 
     def run(self):
         curses.wrapper(self._main)
@@ -358,59 +433,56 @@ class Editor:
         curses.raw()
         curses.set_tabsize(24)
 
+        self.editor = curses.newpad(
+            max(len(self.src), 512),
+            256
+        )
+        self.editor.bkgd(curses.color_pair(1))
+
     def render(self):
-        screen = self.screen
-        code = self.code
         editor = self.editor
-        screen.erase()
-
-        self.parse()
-        for i, tokens in enumerate(self.parsed):
-            offset = self.offsets.get(i)
-            editor.move(i, 0)
-            for t, v in tokens:
-                color = {"name": 2, "op": 3, "const": 4}.get(t, 5)
-                editor.addstr(v, curses.color_pair(color))
-
-            if offset is not None:
-                screen.addstr(i, 0, format(offset, ">4"), curses.color_pair(6))
-                editor.addstr(
-                    "\t" + code.bytecode[offset*2:offset*2+2].hex(" "),
-                    curses.color_pair(8),
-                )
-            else:
-                screen.addstr(i, 0, "   ~", curses.color_pair(6))
+        screen = self.screen
+        status = self.status
 
         with warnings.catch_warnings(record=True) as stinky:
-            self.status.addstr(0, 0, " " * self.mx, curses.color_pair(9))
-            self.status.addstr(0, 1, self.filename or "[scratch]", curses.color_pair(9))
-            self.status.move(1, 0)
-            self.status.addstr("stacksize", curses.color_pair(2))
-            self.status.addstr("=", curses.color_pair(3))
-            self.status.addstr(str(self.code.stacksize), curses.color_pair(4))
-            self.status.addstr(", ", curses.color_pair(3))
+            status.addstr(0, 0, " " * self.mx, curses.color_pair(9))
+            status.addstr(
+                0, 1,
+                (self.filename or "[scratch]") + self.format,
+                curses.color_pair(9)
+            )
+            status.addstr(
+                0, self.mx - 13,
+                "Ctrl+g: help",
+                curses.color_pair(9)
+            )
+            status.move(1, 0)
+            status.addstr("stacksize", curses.color_pair(2))
+            status.addstr("=", curses.color_pair(3))
+            status.addstr(str(self.code.stacksize), curses.color_pair(4))
+            status.addstr(", ", curses.color_pair(3))
 
             try:
                 for field, values in [
-                    ("consts", code.constants),
-                    ("names", code.names),
-                    ("varnames", code.varnames),
-                    ("freevars", code.freevars),
+                    ("consts", self.code.constants),
+                    ("names", self.code.names),
+                    ("varnames", self.code.varnames),
+                    ("freevars", self.code.freevars),
                 ]:
-                    self.status.addstr(field, curses.color_pair(2))
-                    self.status.addstr("=(", curses.color_pair(3))
+                    status.addstr(field, curses.color_pair(2))
+                    status.addstr("=(", curses.color_pair(3))
                     for x in values:
-                        self.status.addstr(repr(x), curses.color_pair(4))
-                        self.status.addstr(", ", curses.color_pair(3))
-                    self.status.addstr("), ", curses.color_pair(3))
+                        status.addstr(repr(x), curses.color_pair(4))
+                        status.addstr(", ", curses.color_pair(3))
+                    status.addstr("), ", curses.color_pair(3))
             except curses.error:
                 pass
 
             for w in stinky:
                 if isinstance(w.message, UnsafeBytecode):
                     msg = str(w.message)
-                    self.status.addstr(0, 0, " " * self.mx, curses.color_pair(7))
-                    self.status.addstr(0, 0, msg, curses.color_pair(7))
+                    status.addstr(0, 0, " " * self.mx, curses.color_pair(7))
+                    status.addstr(0, 0, msg, curses.color_pair(7))
                     i = self.lines.get(
                         int(re.match(r".*: \[(\d+)", msg).group(1)),
                         0
@@ -420,12 +492,16 @@ class Editor:
                     break
 
         screen.move(self.cy, self.cx + 5)
+        editor.noutrefresh(0, 0, 0, 5, self.my - 2, self.mx - 1)
+        status.noutrefresh()
 
     def on_resize(self, y, x):
-        self.editor = self.screen.subwin(y - 2, x - 5, 0, 5)
         self.status = self.screen.subwin(2, x, y - 2, 0)
         self.my = y
         self.mx = x
+        self.redraw()
+        self.editor.noutrefresh(0, 0, 0, 5, y - 2, x - 1)
+        self.screen.noutrefresh()
 
     def on_ch(self, ch: int):
         cx = self.cx
@@ -440,6 +516,7 @@ class Editor:
                 src[cy] = ln[:cx] + chr(ch) + ln[cx:]
             cx += 1
             self.update_code()
+            self.redraw()
         elif ch == curses.KEY_BACKSPACE:
             if cx:
                 src[cy] = src[cy][:cx-1] + src[cy][cx:]
@@ -451,11 +528,13 @@ class Editor:
                 src[cy-1] += src.pop(cy)
                 cy -= 1
             self.update_code()
+            self.redraw()
         elif ch == curses.ascii.NL:
             cy += 1
             cx = 0
             src.insert(cy, "")
             self.update_code()
+            self.redraw()
         elif ch == curses.KEY_LEFT:
             if cx:
                 cx -= 1
@@ -478,6 +557,9 @@ class Editor:
                 cy += 1
                 if cx > len(src[cy]):
                     cx = len(src[cy])
+        elif ch == curses.ascii.ctrl(ord("g")):
+            self.screen.addstr(0, 0, "J")
+            self.screen.getch()
         elif ch == curses.ascii.ctrl(ord("c")):
             raise SystemExit
 
@@ -487,7 +569,9 @@ class Editor:
 
 if __name__ == "__main__":
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hc", ["help", "compile"])
+        opts, args = getopt.getopt(
+            sys.argv[1:], "hcf", ["help", "compile", "force"]
+        )
 
     except getopt.GetoptError as e:
         print(USAGE)
@@ -496,14 +580,17 @@ if __name__ == "__main__":
 
     else:
         needs_compile = False
+        force = False
         for o, _ in opts:
             if o in ("-h", "--help"):
                 print(USAGE)
                 break
             if o in ("-c", "--compile"):
                 needs_compile = True
+            if o in ("-f", "--force"):
+                force = True
         else:
             f = None
             if args:
                 f = args[0]
-            Editor(f, needs_compile=needs_compile).run()
+            Editor(f, needs_compile=needs_compile, force=force).run()
