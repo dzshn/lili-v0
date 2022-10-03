@@ -11,6 +11,7 @@ import tokenize
 import types
 import warnings
 from collections import namedtuple
+from curses import color_pair as color
 from typing import BinaryIO, Optional, Union
 
 from ike.bytecode import PartialCode, UnsafeBytecode
@@ -218,6 +219,7 @@ class Editor:
 
         self.cy = 0
         self.cx = 0
+        self.vy = 0
         self.update_code()
 
     def parse(self):
@@ -376,16 +378,16 @@ class Editor:
             editor.move(i, 0)
             editor.clrtoeol()
             for t, v in tokens:
-                color = {
+                colors = {
                     "name": 2, "op": 3, "const": 4, "section": 2, "field": 4
-                }.get(t, 5)
-                editor.addstr(v, curses.color_pair(color))
+                }
+                editor.addstr(v, color(colors.get(t, 5)))
 
             if offset is not None:
                 instr, arg = raw = self.code.bytecode[offset*2:offset*2+2]
-                editor.addstr("\t" + raw.hex(" "), curses.color_pair(8))
-                # if instr in opcode.hasjabs:
-                #     editor.addstr(self.lines[arg], 32, "<<")
+                editor.addstr("\t" + raw.hex(" "), color(8))
+                if instr in opcode.hasjabs:
+                    editor.addstr(self.lines[arg], 32, "<< %i" % offset)
 
     def run(self):
         curses.wrapper(self._main)
@@ -429,7 +431,7 @@ class Editor:
         for i, (f, b) in enumerate(colors):
             curses.init_pair(i + 1, f, b)
 
-        self.screen.bkgd(" ", curses.color_pair(1))
+        self.screen.bkgd(" ", color(1))
         curses.raw()
         curses.set_tabsize(24)
 
@@ -437,30 +439,38 @@ class Editor:
             max(len(self.src), 512),
             256
         )
-        self.editor.bkgd(curses.color_pair(1))
+        self.editor.bkgd(color(1))
 
     def render(self):
         editor = self.editor
         screen = self.screen
         status = self.status
 
+        for i in range(self.my - 2):
+            if (x := self.offsets.get(self.vy + i)) is not None:
+                mark = format(x, ">4")
+            else:
+                if self.vy + i < len(self.src):
+                    mark = "~"
+                else:
+                    mark = ""
+            screen.addstr(i, 0, format(mark, ">4"), color(6))
+
         with warnings.catch_warnings(record=True) as stinky:
-            status.addstr(0, 0, " " * self.mx, curses.color_pair(9))
+            status.addstr(0, 0, " " * self.mx, color(9))
             status.addstr(
                 0, 1,
-                (self.filename or "[scratch]") + self.format,
-                curses.color_pair(9)
+                (self.filename or "[scratch]") + ":" + self.format,
+                color(9)
             )
             status.addstr(
-                0, self.mx - 13,
-                "Ctrl+g: help",
-                curses.color_pair(9)
+                0, self.mx - 13, "Ctrl+g: help", color(9)
             )
             status.move(1, 0)
-            status.addstr("stacksize", curses.color_pair(2))
-            status.addstr("=", curses.color_pair(3))
-            status.addstr(str(self.code.stacksize), curses.color_pair(4))
-            status.addstr(", ", curses.color_pair(3))
+            status.addstr("stacksize", color(2))
+            status.addstr("=", color(3))
+            status.addstr(str(self.code.stacksize), color(4))
+            status.addstr(", ", color(3))
 
             try:
                 for field, values in [
@@ -469,30 +479,34 @@ class Editor:
                     ("varnames", self.code.varnames),
                     ("freevars", self.code.freevars),
                 ]:
-                    status.addstr(field, curses.color_pair(2))
-                    status.addstr("=(", curses.color_pair(3))
+                    status.addstr(field, color(2))
+                    status.addstr("=(", color(3))
                     for x in values:
-                        status.addstr(repr(x), curses.color_pair(4))
-                        status.addstr(", ", curses.color_pair(3))
-                    status.addstr("), ", curses.color_pair(3))
+                        status.addstr(repr(x), color(4))
+                        status.addstr(", ", color(3))
+                    status.addstr("), ", color(3))
             except curses.error:
                 pass
 
             for w in stinky:
                 if isinstance(w.message, UnsafeBytecode):
                     msg = str(w.message)
-                    status.addstr(0, 0, " " * self.mx, curses.color_pair(7))
-                    status.addstr(0, 0, msg, curses.color_pair(7))
                     i = self.lines.get(
                         int(re.match(r".*: \[(\d+)", msg).group(1)),
                         0
                     )
                     ln = self.src[i]
-                    editor.chgat(i, 0, len(ln), curses.color_pair(7))
+                    editor.chgat(i, 0, len(ln), color(7))
                     break
 
-        screen.move(self.cy, self.cx + 5)
-        editor.noutrefresh(0, 0, 0, 5, self.my - 2, self.mx - 1)
+            if stinky:
+                counter = " ⏺ %s " % len(stinky)
+                status.addstr(0, 0, " " * self.mx, color(7))
+                status.addstr(0, 1, str(stinky[0].message), color(7))
+                status.addstr(0, self.mx - len(counter) - 1, counter, color(7) | curses.A_REVERSE)
+
+        screen.move(self.cy - self.vy, self.cx + 5)
+        editor.noutrefresh(self.vy, 0, 0, 5, self.my - 2, self.mx - 1)
         status.noutrefresh()
 
     def on_resize(self, y, x):
@@ -562,6 +576,11 @@ class Editor:
             self.screen.getch()
         elif ch == curses.ascii.ctrl(ord("c")):
             raise SystemExit
+
+        if cy - self.vy > self.my - 5:
+            self.vy = cy - self.my + 5
+        elif cy - self.vy < 2 and self.vy > 0:
+            self.vy -= 1
 
         self.cx = cx
         self.cy = cy
